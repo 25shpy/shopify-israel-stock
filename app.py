@@ -23,7 +23,12 @@ ISRAEL_LOCATION_ID = os.environ.get("ISRAEL_LOCATION_ID")
 if not all([SHOPIFY_SHOP, SHOPIFY_ACCESS_TOKEN, SHOPIFY_WEBHOOK_SECRET, ISRAEL_LOCATION_ID]):
     raise RuntimeError("Missing environment variables")
 
+
+# --------------------------------------------------------
+#  Shopify yardımcıları
+# --------------------------------------------------------
 def verify_shopify_webhook(raw_body, hmac_header):
+    """Shopify HMAC doğrulaması."""
     digest = hmac.new(
         SHOPIFY_WEBHOOK_SECRET.encode(),
         raw_body,
@@ -32,7 +37,9 @@ def verify_shopify_webhook(raw_body, hmac_header):
     computed = base64.b64encode(digest).decode()
     return hmac.compare_digest(computed, hmac_header or "")
 
+
 def shopify_rest(method, path, params=None, json_body=None):
+    """Shopify REST çağrısı (Admin API)."""
     url = f"https://{SHOPIFY_SHOP}/admin/api/{SHOPIFY_API_VERSION}/{path}"
     headers = {
         "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
@@ -40,13 +47,15 @@ def shopify_rest(method, path, params=None, json_body=None):
     }
     resp = requests.request(method, url, headers=headers, params=params, json=json_body)
     if not resp.ok:
-        app.logger.error(resp.text)
+        app.logger.error(f"REST error {resp.status_code}: {resp.text}")
         resp.raise_for_status()
     if resp.text.strip():
         return resp.json()
     return {}
 
+
 def shopify_graphql(query, variables):
+    """Shopify GraphQL çağrısı."""
     url = f"https://{SHOPIFY_SHOP}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
     headers = {
         "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
@@ -55,94 +64,146 @@ def shopify_graphql(query, variables):
     resp = requests.post(url, headers=headers, json={"query": query, "variables": variables})
     data = resp.json()
     if "errors" in data:
+        app.logger.error(f"GraphQL errors: {data['errors']}")
         raise RuntimeError(data["errors"])
     return data["data"]
 
-def gid_to_id(gid):
+
+def gid_to_id(gid: str) -> str:
+    """gid://shopify/Variant/1234567890 -> 1234567890"""
     return gid.split("/")[-1]
 
-def get_product_inventory_items(inventory_item_id):
+
+# --------------------------------------------------------
+#  inventory_item_id -> variant_id
+# --------------------------------------------------------
+def get_variant_id_from_inventory_item(inventory_item_id: int) -> str:
+    """
+    Verilen inventory_item_id'ye bağlı tek bir variant_id döndürür.
+    """
     gid = f"gid://shopify/InventoryItem/{inventory_item_id}"
     query = """
     query ($id: ID!) {
       inventoryItem(id: $id) {
         variant {
-          product {
-            id
-            variants(first: 100) {
-              edges {
-                node {
-                  inventoryItem { id }
-                }
-              }
-            }
-          }
+          id
         }
       }
     }
     """
     data = shopify_graphql(query, {"id": gid})
-    product_gid = data["inventoryItem"]["variant"]["product"]["id"]
-    product_id = gid_to_id(product_gid)
+    inv_item = data.get("inventoryItem")
+    if not inv_item or not inv_item.get("variant"):
+        raise RuntimeError(f"No variant found for inventory_item_id={inventory_item_id}")
 
-    items = []
-    for edge in data["inventoryItem"]["variant"]["product"]["variants"]["edges"]:
-        invgid = edge["node"]["inventoryItem"]["id"]
-        items.append(gid_to_id(invgid))
+    variant_gid = inv_item["variant"]["id"]
+    variant_id = gid_to_id(variant_gid)
+    return variant_id
 
-    return product_id, items
 
-def has_israel_stock(inv_ids):
+# --------------------------------------------------------
+#  Variant metafield (custom.israel_stock)
+# --------------------------------------------------------
+def set_israel_stock_metafield(variant_id: str, in_israel_stock: bool):
+    """
+    Variant için custom.israel_stock boolean metafield'ını true/false olarak set eder.
+    """
+    app.logger.info(
+        f"Updating metafield custom.israel_stock for variant {variant_id} => {in_israel_stock}"
+    )
+
+    # Önce mevcut metafield var mı diye bak
     params = {
-        "location_ids": ISRAEL_LOCATION_ID,
-        "inventory_item_ids": ",".join(inv_ids)
+        "namespace": "custom",
+        "key": "israel_stock"
     }
-    data = shopify_rest("GET", "inventory_levels.json", params=params)
-    for lvl in data.get("inventory_levels", []):
-        if str(lvl["location_id"]) == str(ISRAEL_LOCATION_ID):
-            if lvl["available"] > 0:
-                return True
-    return False
+    existing = shopify_rest(
+        "GET",
+        f"variants/{variant_id}/metafields.json",
+        params=params
+    ).get("metafields", [])
 
-def update_product_tag(product_id, in_stock):
-    data = shopify_rest("GET", f"products/{product_id}.json", params={"fields": "id,tags"})
-    tags = data["product"]["tags"].split(",")
-    tags = [t.strip() for t in tags if t.strip()]
+    value_str = "true" if in_israel_stock else "false"
 
-    changed = False
-    if in_stock and "Stock" not in tags:
-        tags.append("Stock")
-        changed = True
-    elif not in_stock and "Stock" in tags:
-        tags.remove("Stock")
-        changed = True
-
-    if changed:
-        shopify_rest("PUT", f"products/{product_id}.json", json_body={
-            "product": {
-                "id": int(product_id),
-                "tags": ", ".join(tags)
+    if existing:
+        # Güncelle
+        mf_id = existing[0]["id"]
+        shopify_rest(
+            "PUT",
+            f"metafields/{mf_id}.json",
+            json_body={
+                "metafield": {
+                    "id": mf_id,
+                    "value": value_str,
+                    "type": "boolean"
+                }
             }
-        })
+        )
+    else:
+        # Yeni oluştur
+        shopify_rest(
+            "POST",
+            f"variants/{variant_id}/metafields.json",
+            json_body={
+                "metafield": {
+                    "namespace": "custom",
+                    "key": "israel_stock",
+                    "type": "boolean",
+                    "value": value_str
+                }
+            }
+        )
 
+
+# --------------------------------------------------------
+#  Webhook endpoint
+# --------------------------------------------------------
 @app.route("/webhooks/inventory", methods=["POST"])
 def webhook():
     raw = request.get_data()
     hmac_header = request.headers.get("X-Shopify-Hmac-Sha256", "")
     if not verify_shopify_webhook(raw, hmac_header):
+        app.logger.warning("Invalid HMAC – unauthorized webhook")
         abort(401)
 
     payload = json.loads(raw.decode())
-    if str(payload["location_id"]) != str(ISRAEL_LOCATION_ID):
+    app.logger.info(
+        f"Received inventory webhook: item {payload.get('inventory_item_id')} "
+        f"loc {payload.get('location_id')} avail={payload.get('available')}"
+    )
+
+    # Sadece İsrail lokasyonu için çalış
+    if str(payload.get("location_id")) != str(ISRAEL_LOCATION_ID):
+        app.logger.info("Location is not ISRAEL, skipping.")
         return "", 200
 
-    inv_item = payload["inventory_item_id"]
-    product_id, all_items = get_product_inventory_items(inv_item)
-    in_stock = has_israel_stock(all_items)
-    update_product_tag(product_id, in_stock)
+    inv_item = payload.get("inventory_item_id")
+    if not inv_item:
+        app.logger.warning("No inventory_item_id in payload")
+        return "", 200
+
+    available = payload.get("available")
+    if available is None:
+        app.logger.warning("No 'available' field in payload; skipping metafield update")
+        return "", 200
+
+    # İlgili variant_id'yi bul
+    try:
+        variant_id = get_variant_id_from_inventory_item(inv_item)
+    except Exception as e:
+        app.logger.error(f"Error getting variant for inventory_item_id={inv_item}: {e}")
+        return "", 200
+
+    # İsrail stok durumu
+    in_israel_stock = available > 0
+    set_israel_stock_metafield(variant_id, in_israel_stock)
 
     return "", 200
 
+
+# --------------------------------------------------------
+#  Local run
+# --------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
