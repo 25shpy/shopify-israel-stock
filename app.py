@@ -200,6 +200,75 @@ def webhook():
 
     return "", 200
 
+def sync_inventory_simple():
+    import requests
+    import os
+
+    SHOP = os.environ["SHOPIFY_SHOP_DOMAIN"]
+    TOKEN = os.environ["SHOPIFY_ACCESS_TOKEN"]
+    API_VERSION = "2025-01"
+    ISRAEL_ID = os.environ["ISRAEL_LOCATION_ID"]
+    CHINA_ID = os.environ["CHINA_LOCATION_ID"]
+
+    headers = {"X-Shopify-Access-Token": TOKEN}
+
+    def get_levels(location_id):
+        url = f"https://{SHOP}/admin/api/{API_VERSION}/inventory_levels.json?location_ids={location_id}&limit=250"
+        r = requests.get(url, headers=headers)
+        return r.json().get("inventory_levels", [])
+
+    israel_levels = get_levels(ISRAEL_ID)
+    china_levels = get_levels(CHINA_ID)
+
+    inventory_map = {}
+
+    for lvl in israel_levels:
+        inventory_map.setdefault(lvl["inventory_item_id"], {"israel": False, "china": False})
+        inventory_map[lvl["inventory_item_id"]]["israel"] = lvl["available"] > 0
+
+    for lvl in china_levels:
+        inventory_map.setdefault(lvl["inventory_item_id"], {"israel": False, "china": False})
+        inventory_map[lvl["inventory_item_id"]]["china"] = lvl["available"] > 0
+
+    # Update metafields
+    for inv_id, flags in inventory_map.items():
+        # Find variant by inventory_item_id
+        url_v = f"https://{SHOP}/admin/api/{API_VERSION}/variants.json?inventory_item_ids={inv_id}"
+        rv = requests.get(url_v, headers=headers).json()
+        if not rv.get("variants"): 
+            continue
+        var_id = rv["variants"][0]["id"]
+
+        # ISRAEL
+        payload = {
+            "metafield": {
+                "namespace": "custom",
+                "key": "israel_stock",
+                "type": "boolean",
+                "value": flags["israel"],
+                "owner_resource": "variant",
+                "owner_id": var_id,
+            }
+        }
+        requests.post(f"https://{SHOP}/admin/api/{API_VERSION}/metafields.json", headers=headers, json=payload)
+
+        # CHINA
+        payload["metafield"]["key"] = "china_stock"
+        payload["metafield"]["value"] = flags["china"]
+        requests.post(f"https://{SHOP}/admin/api/{API_VERSION}/metafields.json", headers=headers, json=payload)
+
+    return True
+
+
+@app.route("/admin/run-sync")
+def run_sync_simple():
+    ok = sync_inventory_simple()
+    return "Sync OK" if ok else "Sync Error"
+
+
+
+
+
 
 # --------------------------------------------------------
 #  Local run
