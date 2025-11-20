@@ -243,8 +243,14 @@ def sync_inventory_simple():
 
 @app.route("/admin/run-sync")
 def run_sync_simple():
-    ok = sync_inventory_simple()
-    return "Sync OK" if ok else "Sync Error"
+    try:
+        ok = sync_inventory_simple()
+        return "Sync OK" if ok else "Sync Error"
+    except Exception as e:
+        # Hata hem log'a gitsin hem de ekranda görelim
+        app.logger.exception("Error in sync_inventory_simple")
+        return f"Sync ERROR: {e}", 500
+
 
 
 
