@@ -201,62 +201,43 @@ def webhook():
     return "", 200
 
 def sync_inventory_simple():
-    import requests
-    import os
+    """
+    İsrail lokasyonundaki TÜM inventory_item'ları okuyup
+    her biri için custom.israel_stock metafield'ini,
+    gerçek 'available > 0' durumuna göre yeniden yazar.
+    """
+    app.logger.info("Running simple inventory sync for ISRAEL location...")
 
-    SHOP = os.environ["SHOPIFY_SHOP_DOMAIN"]
-    TOKEN = os.environ["SHOPIFY_ACCESS_TOKEN"]
-    API_VERSION = "2025-01"
-    ISRAEL_ID = os.environ["ISRAEL_LOCATION_ID"]
-    CHINA_ID = os.environ["CHINA_LOCATION_ID"]
-
-    headers = {"X-Shopify-Access-Token": TOKEN}
-
-    def get_levels(location_id):
-        url = f"https://{SHOP}/admin/api/{API_VERSION}/inventory_levels.json?location_ids={location_id}&limit=250"
-        r = requests.get(url, headers=headers)
-        return r.json().get("inventory_levels", [])
-
-    israel_levels = get_levels(ISRAEL_ID)
-    china_levels = get_levels(CHINA_ID)
-
-    inventory_map = {}
-
-    for lvl in israel_levels:
-        inventory_map.setdefault(lvl["inventory_item_id"], {"israel": False, "china": False})
-        inventory_map[lvl["inventory_item_id"]]["israel"] = lvl["available"] > 0
-
-    for lvl in china_levels:
-        inventory_map.setdefault(lvl["inventory_item_id"], {"israel": False, "china": False})
-        inventory_map[lvl["inventory_item_id"]]["china"] = lvl["available"] > 0
-
-    # Update metafields
-    for inv_id, flags in inventory_map.items():
-        # Find variant by inventory_item_id
-        url_v = f"https://{SHOP}/admin/api/{API_VERSION}/variants.json?inventory_item_ids={inv_id}"
-        rv = requests.get(url_v, headers=headers).json()
-        if not rv.get("variants"): 
-            continue
-        var_id = rv["variants"][0]["id"]
-
-        # ISRAEL
-        payload = {
-            "metafield": {
-                "namespace": "custom",
-                "key": "israel_stock",
-                "type": "boolean",
-                "value": flags["israel"],
-                "owner_resource": "variant",
-                "owner_id": var_id,
-            }
+    # 1) İsrail lokasyonundaki stok seviyelerini çek
+    levels_resp = shopify_rest(
+        "GET",
+        "inventory_levels.json",
+        params={
+            "location_ids": ISRAEL_LOCATION_ID,
+            "limit": 250
         }
-        requests.post(f"https://{SHOP}/admin/api/{API_VERSION}/metafields.json", headers=headers, json=payload)
+    )
+    levels = levels_resp.get("inventory_levels", [])
+    app.logger.info(f"Fetched {len(levels)} inventory_levels for ISRAEL")
 
-        # CHINA
-        payload["metafield"]["key"] = "china_stock"
-        payload["metafield"]["value"] = flags["china"]
-        requests.post(f"https://{SHOP}/admin/api/{API_VERSION}/metafields.json", headers=headers, json=payload)
+    # 2) Her inventory_item için variant_id bul ve metafield güncelle
+    for lvl in levels:
+        inv_item_id = lvl.get("inventory_item_id")
+        available = lvl.get("available", 0) or 0
 
+        if not inv_item_id:
+            continue
+
+        try:
+            variant_id = get_variant_id_from_inventory_item(inv_item_id)
+        except Exception as e:
+            app.logger.error(f"Error getting variant for inventory_item_id={inv_item_id}: {e}")
+            continue
+
+        in_israel_stock = available > 0
+        set_israel_stock_metafield(variant_id, in_israel_stock)
+
+    app.logger.info("Simple inventory sync for ISRAEL finished.")
     return True
 
 
